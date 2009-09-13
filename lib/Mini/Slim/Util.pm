@@ -95,7 +95,6 @@ the specified default is returned, instead.
 
 The following config files are read, in order:
 
-* ".mini-slim-state in the user's HOME directory
 * A file pointed to by the MINISLIM environment variable
 * ".mini-slim" in the user's HOME directory
 * /etc/mini-slim.conf
@@ -108,7 +107,6 @@ my $loaded_config_before = 0;
 our @config; # marked as "our" so the testsuite can override it
 if(!$loaded_config_before) {
     foreach my $config_file (
-            $ENV{HOME}."/.mini-slim-state",
             $ENV{MINISLIM},
             $ENV{HOME}."/.mini-slim",
             "/etc/mini-slim.conf") {
@@ -134,6 +132,24 @@ sub config :Export(:DEFAULT) {
     return $value;
 }
 
+
+=head2 perclient_config
+
+    my $value = $self->perclient_config($mac, "variable_name", $default);
+
+Fetch per-client state settings, falling back on global config (and eventually,
+the provided default) if needed.
+
+=cut
+
+my %perclient_state;
+sub perclient_config {
+    my ($self, $mac, $keyword, $default) = @_;
+    $self->info("perclient_config: mac=$mac keyword=$keyword\n");
+    return config($keyword, $default);
+#    if(!exists
+#        push(@config, LoadFile($config_file));
+}
 
 =head1 AUTHOR
 

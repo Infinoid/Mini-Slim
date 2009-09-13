@@ -2,9 +2,12 @@ package Mini::Slim;
 
 use warnings;
 use strict;
+use 5.006;
+use v5.10.0;
 
 use IO::Select;
 use IO::Socket::INET;
+use Time::HiRes qw(tv_interval gettimeofday);
 use blib;
 use Mini::Slim::Util;
 use base 'Mini::Slim::Util';
@@ -52,6 +55,7 @@ sub new {
         alive => 1,
         sel   => IO::Select->new(),
         args  => \@args,
+        work  => [],
     }, $package);
     return $self;
 }
@@ -77,7 +81,12 @@ sub server {
     );
     $$self{sel}->add($listener);
     while($$self{alive}) {
-        my @handles = $$self{sel}->can_read(5);
+        my $sleep_interval = 5;
+        if(scalar @{$$self{work}}) {
+            $sleep_interval = 0.1;
+            $self->do_work();
+        }
+        my @handles = $$self{sel}->can_read($sleep_interval);
         foreach my $handle (@handles) {
             if($handle == $listener) {
                 $self->handle_listener_read($handle);
@@ -88,27 +97,60 @@ sub server {
     }
 }
 
-sub play_this {
+sub do_work {
+    my $self = shift;
+    my @pending = @{$$self{work}};
+    $$self{work} = [];
+    while(scalar @pending) {
+        my $work = shift @pending;
+        $$work{args} = [] unless exists $$work{args};
+        my $handler  = $$work{handler};
+        my @args     = @{$$work{args}};
+        &$handler(@args);
+    }
+}
+
+sub schedule_work {
+    my ($self, $handler, @args) = @_;
+    push(@{$$self{work}}, { handler => $handler, args => \@args });
+}
+
+sub play {
     my ($self, $client) = @_;
     my $pl_entries = scalar @{$$client{playlist}};
-    return $self->info("play_this failed because playlist is empty.\n")
+    return $self->info("play failed because playlist is empty.\n")
         unless $pl_entries;
     $$client{pl_pos} = $pl_entries - 1
         if($$client{pl_pos} >= $pl_entries);
-    $self->start_playback($client, $$client{playlist}[$$client{pl_pos}]);
+    if($$client{state} eq 'paused') {
+        $self->send_strm($client, command    => 'u');
+    } else {
+        $self->stream_new_track($client, $$client{playlist}[$$client{pl_pos}]);
+    }
 }
 
-sub play_next {
+sub skip_next {
     my ($self, $client) = @_;
     my $pl_entries = scalar @{$$client{playlist}};
-    $self->play_this($client) if(++$$client{pl_pos} < $pl_entries);
+    $self->play($client) if(++$$client{pl_pos} < $pl_entries);
 }
 
-sub start_playback {
+sub skip_prev {
+    my ($self, $client) = @_;
+    my $pl_entries = scalar @{$$client{playlist}};
+    $self->play($client) if(--$$client{pl_pos} >= 0);
+}
+
+sub pause {
+    my ($self, $client) = @_;
+    $self->send_strm($client, command    => 'p');
+}
+
+sub stream_new_track {
     my ($self, $client, $path) = @_;
     my $realpath = config('musicdir', '') . $path;
     if(!-f $realpath) {
-        $self->info("start_playback: could not find $path!\n");
+        $self->info("stream_new_track: could not find $path!\n");
         return -1;
     }
     my $type;
@@ -123,21 +165,143 @@ sub start_playback {
             'wma'  => 'w',
         );
         if(!exists($type_by_extension{$ext})) {
-            $self->info("start_playback: could not recognize extension '$ext'\n");
+            $self->info("stream_new_track: could not recognize extension '$ext'\n");
             return -1;
         }
         $type = $type_by_extension{$ext};
     } else {
-        $self->info("start_playback: could not find file extension in $path\n");
+        $self->info("stream_new_track: could not find file extension in $path\n");
         return -1;
     }
     my $http_path = config('httpdir', '') . $path;
+    # close any previous connection it may have had.
+    $self->send_strm($client, command    => 'f');
+    # start the new stream
     $self->send_strm($client,
         command    => 's',
         format     => $type,
         autostart  => 1,
         http_query => "GET $http_path HTTP/1.0\r\n\r\n",
     );
+}
+
+
+=head1 UI
+
+=head2 handle_keypress
+
+Handle keys sent to us via an infrared remote control.
+
+=cut
+
+# unhandled keys:
+#        power
+#        add up play
+#        left unknown right
+#        unknown down browse
+#        1 2 3 4 5 6 7 8 9
+#        favorites 0 search
+#        shuffle repeat sleep
+#        nowplaying size brightness
+our %keypress_handlers = (
+    'volup'   => { handler => \&key_volume_handler, fluid => 1 },
+    'voldown' => { handler => \&key_volume_handler, fluid => 1 },
+    'rewind'  => { handler => \&key_seek_handler,   fluid => 1 },
+    'fastfwd' => { handler => \&key_seek_handler,   fluid => 1 },
+    'pause'   => { handler => \&key_pause_handler },
+);
+sub handle_keypress {
+    my ($self, $client, $key, $ts) = @_;
+    if(!exists($keypress_handlers{$key})) {
+        $self->info("dropping unhandled key $key.\n");
+        return -1;
+    }
+    my $fluid   = $keypress_handlers{$key}{fluid} // 0;
+    my $handler = $keypress_handlers{$key}{handler};
+    if(!$fluid) {
+        # the client keeps sending us rapid keypress events until the button
+        # is released.  The timestamp lets us filter out the duplicates.
+        my $last = $$client{lastpress}{$key} // 0;
+        $$client{lastpress}{$key} = $ts;
+        if(($ts - $$client{repeatrate}) <= $last) {
+            return -1;
+        }
+    }
+    return &$handler($self, $client, $ts, $key);
+}
+
+sub key_volume_handler {
+    my ($self, $client, $ts, $key) = @_;
+    my $delta = ($key eq 'volup') ? 1 : -1;
+    my $volume = $$client{volume} + $delta;
+    if(0 <= $volume && $volume < 128) {
+        $$client{volume} = $volume;
+        $self->send_audg($client);
+        return 0;
+    } else {
+        $self->info("limiting volume to $$client{volume}\n");
+        return -1;
+    }
+}
+
+sub key_pause_handler {
+    my ($self, $client, $ts, $key) = @_;
+    if($$client{state} eq 'paused') {
+        return $self->play($client);
+    }
+    $self->info("key_pause_handler: current state is $$client{state}\n");
+    return $self->pause($client);
+}
+
+sub key_seek_handler {
+    my ($self, $client, $ts, $key) = @_;
+    $$client{lastpress}{$key} = [gettimeofday];
+    $$client{seek}{$key} = { mode => 'done' }
+        unless exists $$client{seek}{$key};
+    my $state = $$client{seek}{$key};
+    my $mode = $$state{mode};
+    if($mode eq 'done') {
+        # new keypress.
+        $mode = 'track';
+        $$state{mode}  = $mode;
+        $$state{begin} = [gettimeofday];
+        $$state{unit}  = 1;
+        $self->schedule_work(\&key_seek_timer, $self, $client, $key);
+    } else {
+        # if the button is held for more than a second, it's a seek, not a skip.
+        if(tv_interval($$state{begin}) >= 1) {
+            if($mode eq 'track') {
+                $$state{mode} = 'seek';
+            } else {
+                $$state{unit}++;
+            }
+        }
+    }
+}
+
+sub key_seek_timer {
+    my ($self, $client, $key) = @_;
+    return if exists $$client{dead};
+    my $state = $$client{seek}{$key};
+    my $lastseen = tv_interval($$client{lastpress}{$key});
+    $lastseen *= 1000;
+    if($lastseen > $$client{repeatrate}) {
+        # the user has released the key, take action.
+        if($$state{mode} eq 'seek') {
+            my $unit = $$state{unit};
+            $self->info("seek: $key $unit seconds. (implement me!)\n");
+        } else {
+            if($key eq 'rewind') {
+                $self->skip_prev($client);
+            } elsif($key eq 'fastfwd') {
+                $self->skip_next($client);
+            }
+        }
+        $$state{mode} = 'done';
+    } else {
+        # reschedule ourselves to check again later.
+        $self->schedule_work(\&key_seek_timer, $self, $client, $key);
+    }
 }
 
 
@@ -204,6 +368,38 @@ sub send_strm {
         server_ip
     )}) . $values{http_query};
     return $self->send_packet($client, 'strm', $packet);
+}
+
+sub send_aude {
+    my ($self, $client, %args) = @_;
+    my %defaults = (
+        spdif_enable => 1,
+        dac_enable   => 1,
+    );
+    my %values = ( %defaults, %args );
+    my $packet = pack('CC',@values{qw(spdif_enable dac_enable)});
+    return $self->send_packet($client, 'aude', $packet);
+}
+
+sub send_audg {
+    my ($self, $client, %args) = @_;
+    my %defaults = (
+        old_left  => $$client{volume},  # 0..127
+        old_right => $$client{volume},  # 0..127
+        dvc       => 1,
+        preamp    => 0xff,
+        new_left  => $$client{volume} << 9,  # 0..65535
+        new_right => $$client{volume} << 9,  # 0..65535
+        unknown   => 0,
+    );
+    my %values = ( %defaults, %args );
+    my $packet = pack('NNCCNNC',@values{qw(
+        old_left old_right
+        dvc preamp
+        new_left new_right
+    )});
+    $self->hexdump($packet);
+    return $self->send_packet($client, 'audg', $packet);
 }
 
 sub send_visu {
@@ -306,13 +502,12 @@ sub handle_listener_read {
     my $addr = $socket->peerhost();
     $self->info("Received client connection from $addr\n");
     $$self{clients}{$fd} = {
-        sock      => $socket,
-        connected => time(),
-        peername  => $addr,
-        inbuf     => '',
-        fd        => $fd,
-        playlist  => [@{$$self{args}}],
-        pl_pos    => 0,
+        sock       => $socket,
+        connected  => time(),
+        peername   => $addr,
+        inbuf      => '',
+        fd         => $fd,
+        state      => 'pending',
     };
     $$self{sel}->add($socket);
 }
@@ -335,6 +530,7 @@ sub handle_client_read {
         return;
     } elsif(!$rv) {
         $self->info("Got EOF from client " . $$client{peername} . "\n");
+        $$client{dead} = 1; # for timer callbacks
         $$self{sel}->remove($socket);
         delete($$self{clients}{$fd});
         return;
@@ -352,7 +548,7 @@ Returns the number of bytes consumed.
 
 =cut
 
-my %commands = (
+our %recv_commands = (
     'HELO' => { parser => 'custom', handler => \&handle_HELO },
     'STAT' => { parser => 'custom', handler => \&handle_STAT },
     'RESP' => { parser => 'A*'    , handler => \&handle_RESP },
@@ -370,31 +566,18 @@ sub handle_client_command {
     # the full packet has arrived, remove it from the inbuf.
     $buf = substr($$client{inbuf}, 0, $datalen + 8, '');
     $buf = substr($buf, 8); # ... and strip off the command/size prefix
-    if(!exists($commands{$cmd})) {
+    if(!exists($recv_commands{$cmd})) {
         $self->info("$addr: I don't know how to handle command $cmd (len $datalen).\n");
         return -1;
     }
-    my ($parser, $handler) = @{$commands{$cmd}}{qw(parser handler)};
+    my ($parser, $handler) = @{$recv_commands{$cmd}}{qw(parser handler)};
     if($parser eq 'custom') {
-#        $self->info("$addr: custom handling $cmd with datalen $datalen\n");
         &$handler($self, $client, $buf);
     } else {
         my @args = unpack($parser, $buf);
-        $self->info("$addr: handling $cmd with datalen $datalen\n");
         &$handler($self, $client, @args);
     }
     return $datalen + 8;
-}
-
-
-=head2 handle_keypress
-
-Handle keys sent to us via an infrared remote control.
-
-=cut
-
-sub handle_keypress {
-    my ($self, $client, $key, $ts) = @_;
 }
 
 
@@ -433,16 +616,26 @@ sub handle_HELO {
         $$client{type} = "unknown ($type)";
     }
     $$client{revision} = vec($data, 1, 8);
-    $$client{mac}      = substr($data, 2, 6);
+    $$client{mac}      = sprintf("%02x" x 6, unpack("C6", substr($data, 2, 6)));
+    my $mac            = $$client{mac};
     my $offset = 8;
     # insert more parsing here if we ever care about the remaining fields
     #$self->hexdump($data);
     # reply with our version
 #    $self->send_version($client, "MiniSlim-$VERSION");
+
+    # load per-client state.
+    $$client{playlist}   = $self->perclient_config($mac, 'playlist', [@{$$self{args}}]);
+    $$client{pl_pos}     = $self->perclient_config($mac, 'pl_pos',   0);
+    $$client{volume}     = $self->perclient_config($mac, "volume",   10);
+    $$client{repeatrate} = 200;
+
     $self->send_version($client, "6.5.4");
+    $self->send_aude($client);
+    $self->send_audg($client);
     $self->send_visu($client, which => 0);
     $self->send_visu($client, which => 2);
-    $self->play_this($client);
+    $self->play($client);
     return 0;
 }
 
@@ -499,10 +692,9 @@ sub handle_STAT {
     if(defined($event) && exists($event_state_map{$event})) {
         my $state = $event_state_map{$event};
         if($state eq 'need next track') {
-            $self->play_next($client);
+            $self->skip_next($client);
         } else {
-            $$client{$state} = $state;
-            $self->info("client transitioning to state $state\n");
+            $$client{state} = $state;
         }
     }
     return 0;
@@ -574,7 +766,7 @@ sub handle_IR {
         $self->info("Unknown key pressed, key $key dropped.\n");
         return -1;
     }
-    return $self->handle_keypress($client, $key, $timestamp);
+    return $self->handle_keypress($client, $squeezebox_remote_keys[$key], $timestamp);
 }
 
 
