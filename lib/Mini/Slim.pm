@@ -1082,6 +1082,17 @@ L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Mini-Slim>
 =back
 
 
+=head1 ACKNOWLEDGEMENTS
+
+Mad props to slim devices for making nifty hardware.
+
+Also, props to whoever wrote this:
+
+    http://wiki.slimdevices.com/index.php/SlimProtoTCPProtocol
+
+It isn't always accurate, but it's a whole lot better than nothing.
+
+
 =head1 COPYRIGHT & LICENSE
 
 Copyright 2009 "Mark Glines", all rights reserved.
