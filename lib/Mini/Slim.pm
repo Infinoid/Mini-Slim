@@ -5,12 +5,20 @@ use strict;
 use 5.006;
 use v5.10.0;
 
+use File::Basename;
+use GD;
 use IO::Select;
 use IO::Socket::INET;
 use Time::HiRes qw(tv_interval gettimeofday);
 use blib;
 use Mini::Slim::Util;
 use base 'Mini::Slim::Util';
+
+# attempt to use these if available, but we can live without them
+our $have_audio_flac_header = 0;
+eval { require Audio::FLAC::Header; $have_audio_flac_header = 1 };
+our $have_mp3_info = 0;
+eval { require MP3::Info; $have_mp3_info = 1 };
 
 =head1 NAME
 
@@ -34,7 +42,7 @@ Serve music to squeezeboxes and similar devices.
     Mini::Slim->new->server();
 
 
-=head1 CONSTRUCTOR
+=head1 CONSTRUCTORS
 
 =head2 new
 
@@ -58,6 +66,33 @@ sub new {
         work  => [],
     }, $package);
     return $self;
+}
+
+=head2 new_client
+
+The listener socket got a new connection, set up the new client.
+
+=cut
+
+sub new_client {
+    my ($self, $listener) = @_;
+    my $socket = $listener->accept();
+    if(!defined($socket)) {
+        $self->info("Listener socket couldn't accept new connection.\n");
+        return;
+    }
+    my $fd   = $socket->fileno();
+    my $addr = $socket->peerhost();
+    $self->info("Received client connection from $addr\n");
+    $$self{clients}{$fd} = {
+        sock      => $socket,
+        connected => time(),
+        addr      => $addr,
+        inbuf     => '',
+        fd        => $fd,
+        state     => 'pending',
+    };
+    $$self{sel}->add($socket);
 }
 
 
@@ -89,7 +124,7 @@ sub server {
         my @handles = $$self{sel}->can_read($sleep_interval);
         foreach my $handle (@handles) {
             if($handle == $listener) {
-                $self->handle_listener_read($handle);
+                $self->new_client($handle);
             } else {
                 $self->handle_client_read($handle);
             }
@@ -113,6 +148,12 @@ sub do_work {
 sub schedule_work {
     my ($self, $handler, @args) = @_;
     push(@{$$self{work}}, { handler => $handler, args => \@args });
+}
+
+sub stop {
+    my ($self, $client) = @_;
+    $self->send_strm($client, command => 'q');
+    $self->send_strm($client, command => 'f');
 }
 
 sub play {
@@ -143,11 +184,12 @@ sub skip_prev {
 
 sub pause {
     my ($self, $client) = @_;
-    $self->send_strm($client, command    => 'p');
+    $self->send_strm($client, command => 'p');
 }
 
 sub stream_new_track {
     my ($self, $client, $path) = @_;
+    delete($$client{tracklen});
     my $realpath = config('musicdir', '') . $path;
     if(!-f $realpath) {
         $self->info("stream_new_track: could not find $path!\n");
@@ -183,10 +225,11 @@ sub stream_new_track {
         autostart  => 1,
         http_query => "GET $http_path HTTP/1.0\r\n\r\n",
     );
+    $self->schedule_work(\&find_track_len, $self, $client, $realpath);
 }
 
 
-=head1 UI
+=head1 UI Input
 
 =head2 handle_keypress
 
@@ -204,11 +247,12 @@ Handle keys sent to us via an infrared remote control.
 #        shuffle repeat sleep
 #        nowplaying size brightness
 our %keypress_handlers = (
-    'volup'   => { handler => \&key_volume_handler, fluid => 1 },
-    'voldown' => { handler => \&key_volume_handler, fluid => 1 },
-    'rewind'  => { handler => \&key_seek_handler,   fluid => 1 },
-    'fastfwd' => { handler => \&key_seek_handler,   fluid => 1 },
-    'pause'   => { handler => \&key_pause_handler },
+    'volup'      => { handler => \&key_volume_handler, fluid => 1 },
+    'voldown'    => { handler => \&key_volume_handler, fluid => 1 },
+    'rewind'     => { handler => \&key_seek_handler,   fluid => 1 },
+    'fastfwd'    => { handler => \&key_seek_handler,   fluid => 1 },
+    'pause'      => { handler => \&key_pause_handler },
+    'brightness' => { handler => \&key_brightness_handler },
 );
 sub handle_keypress {
     my ($self, $client, $key, $ts) = @_;
@@ -304,6 +348,471 @@ sub key_seek_timer {
     }
 }
 
+sub key_brightness_handler {
+    my ($self, $client, $ts, $key) = @_;
+    return if $$client{display} eq 'unknown';
+    $$client{brightness}++;
+    $$client{brightness} = 0 if $$client{brightness} > 4;
+    $self->send_grfb($client, level => $$client{brightness});
+}
+
+
+=head1 UI Output
+
+=head2 setup_display
+
+Set up the client's display.
+
+=cut
+
+sub setup_display {
+    my ($self, $client) = @_;
+    $self->send_grfb($client, level => $$client{brightness});
+    $self->send_visu($client, which => 0);
+    $self->send_visu($client, which => 2);
+    my ($xsize, $ysize) = ($$client{display} =~ /(\d+)x(\d+)/);
+    $$client{xsize} = $xsize;
+    $$client{ysize} = $ysize;
+    $self->info("setup_display: $xsize x $ysize\n");
+    $$client{gd} = GD::Image->new($xsize, $ysize);
+    $$client{gd_white} = $$client{gd}->colorAllocate(255,255,255);
+    $$client{gd_black} = $$client{gd}->colorAllocate(0,0,0);
+    $$client{gd}->filledRectangle(0, 0, $xsize-1, $ysize-1, $$client{gd_black});
+}
+
+=head2 update_display
+
+Shovel bits from the GD buffer to the client display.
+
+Currently this uses WBMP as an intermediate format, but I'm open to better
+ideas if anyone has one.
+
+=cut
+
+sub update_display {
+    my ($self, $client) = @_;
+    my $xsize     = $$client{xsize};
+    my $ysize     = $$client{ysize};
+    my $xstart    = 0;
+    my $xend      = $xsize - 1;
+    my $colshiftB = ${ {
+        32 => 2, # 32 bits = 4 bytes = 1<<2
+    }}{$ysize};
+    my $colshiftb = $colshiftB + 3;
+    my $outbuf;
+    my $wbmp      = $$client{gd}->wbmp($$client{gd_black});
+    # strip off header
+    substr($wbmp, 0, 5, '');
+    my @wbmp_yboffsets = map {
+        ($xsize & 7 ? ($xsize+8) & 0xfffffff8 : $xsize) * $_
+    } (0..$ysize-1);
+    my @wbmp_xboffsets = map {
+        ($_+7) - (($_ & 7) << 1)
+    } (0..$xend-1);
+    my @wbmp_yBoffsets = map { $_ >> 3 } (@wbmp_yboffsets);
+    my $x = $xstart;
+    while($x < $xend) {
+        my $outbuf_column_offset = ($x-$xstart) << $colshiftb;
+#        if((!($x & 0x7)) && (($xend - $x) >= 8)) {
+#            # handle whole bytes at a time.
+#            foreach my $y (0..$ysize-1) {
+#                my $yoff = $outbuf_column_offset + $y;
+#                my $byte = vec($wbmp, $wbmp_yBoffsets[$y] + $x, 8);
+#                foreach my $bit (0..7) {
+#                    vec($outbuf, $yoff + ($bit << $colshiftb), 1) = ($byte & 1);
+#                    $byte >>= 1;
+#                }
+#            }
+#            $x += 8;
+#        } else
+        {
+            # handle a single column.
+            my $bitstring = '';
+            my $xboffset = $wbmp_xboffsets[$x];
+            foreach my $y (0..$ysize-1) {
+                $bitstring .= vec($wbmp, $xboffset + $wbmp_yboffsets[$y], 1);
+            }
+            $outbuf .= pack("B$ysize", $bitstring);
+            $x++;
+        }
+    }
+    $self->send_grfe($client,
+        offset     => 0,
+        transition => 'c',
+        param      => 0,
+        data       => $outbuf
+    );
+}
+
+=head2 render_text_at
+
+Render text on the client's display.
+
+=cut
+
+sub render_text_at {
+    my ($self, $client, $x, $y, $xend, $yend, $text, $font) = @_;
+    $font = GD::Font->Small() unless defined $font;
+    $$client{gd}->filledRectangle($x, $y, $xend, $yend, $$client{gd_black});
+    $$client{gd}->string($font, $x+1, $y, $text, $$client{gd_white});
+}
+
+=head2 update_track_pos
+
+Updates the track position and playback progress bar.
+
+=cut
+
+sub update_track_pos {
+    my ($self, $client) = @_;
+    my $seconds = $$client{trackpos};
+    my $seconds_part = $seconds % 60;
+    my $minutes_part = ($seconds - $seconds_part) / 60;
+    $seconds_part = "0$seconds_part" while length($seconds_part) < 2;
+    $self->render_text_at($client, 0, 0, 239, 12, "$minutes_part:$seconds_part");
+    if(defined($$client{tracklen})) {
+        my $tracklen = int($$client{tracklen});
+        $seconds_part = $tracklen % 60;
+        $minutes_part = ($tracklen - $seconds_part) / 60;
+        $self->render_text_at($client, 190, 0, 239, 12, "$minutes_part:$seconds_part");
+        my $full = $seconds / $$client{tracklen};
+        $full *= (180-45);
+        $$client{gd}->arc(45 , 6, 6, 6, 90 , 270, $$client{gd_white});
+        $$client{gd}->arc(180, 6, 6, 6, 270, 90 , $$client{gd_white});
+        $$client{gd}->line(45, 3, 180, 3, $$client{gd_white});
+        $$client{gd}->line(45, 9, 180, 9, $$client{gd_white});
+        $$client{gd}->line(45, 3, 45 , 9, $$client{gd_white});
+        $$client{gd}->fill(44, 6, $$client{gd_white});
+        $$client{gd}->filledRectangle(45, 3, 45+$full, 9, $$client{gd_white});
+    }
+}
+
+=head2 update_track_name
+
+Updates the track name on the LCD.
+
+=cut
+
+sub update_track_name {
+    my ($self, $client) = @_;
+    return unless $$client{state} eq 'playing';
+    my $font = GD::Font->Large();
+    my $track = $$client{playlist}[$$client{pl_pos}];
+    $self->render_text_at($client, 0, 15, 320, 31, basename($track), $font);
+}
+
+=head2 update_playlist_pos
+
+Updates the current position within the playlist.
+
+=cut
+
+sub update_playlist_pos {
+    my ($self, $client) = @_;
+    my $pos = $$client{pl_pos} + 1;
+    my $total = scalar @{$$client{playlist}};
+    $self->render_text_at($client, 240, 0, 320, 12, "list: $pos/$total");
+}
+
+
+=head1 RECEIVE PATH
+
+=head2 handle_client_read
+
+The client socket sent us some data, handle it.
+
+=cut
+
+sub handle_client_read {
+    my ($self, $socket) = @_;
+    my $fd     = $socket->fileno();
+    my $client = $$self{clients}{$fd};
+    # append to current inbuf
+    my $rv     = $socket->sysread($$client{inbuf}, 4096, length($$client{inbuf}));
+    if($rv < 0) {
+        $self->info("Client read returned $rv ($!)\n");
+        return;
+    } elsif(!$rv) {
+        $self->info("Got EOF from client " . $$client{addr} . "\n");
+        $$client{dead} = 1; # for timer callbacks
+        $$self{sel}->remove($socket);
+        delete($$self{clients}{$fd});
+        return;
+    }
+    while($self->handle_client_command($client) > 0) {}
+}
+
+
+=head2 handle_client_command
+
+The client socket sent us some data.  Check whether a command has been fully
+received, and if so, dispatch to the right command handler.
+
+Returns the number of bytes consumed.
+
+=cut
+
+our %recv_commands = (
+    'HELO' => { parser => 'custom', handler => \&handle_HELO },
+    'STAT' => { parser => 'custom', handler => \&handle_STAT },
+    'RESP' => { parser => 'A*'    , handler => \&handle_RESP },
+    'IR'   => { parser => 'NCCnCC', handler => \&handle_IR },
+    'DSCO' => { parser => 'C'     , handler => \&handle_DSCO },
+);
+sub handle_client_command {
+    my ($self, $client) = @_;
+    my $addr = $$client{addr};
+    my $buf  = $$client{inbuf};
+    my $blen = length($buf);
+    return 0 if $blen < 8;
+    my ($cmd, $datalen) = unpack("A4N", $buf);
+    return 0 if $blen < (8 + $datalen);
+    # the full packet has arrived, remove it from the inbuf.
+    $buf = substr($$client{inbuf}, 0, $datalen + 8, '');
+    $buf = substr($buf, 8); # ... and strip off the command/size prefix
+    if(!exists($recv_commands{$cmd})) {
+        $self->info("$addr: I don't know how to handle command $cmd (len $datalen).\n");
+        return -1;
+    }
+    my ($parser, $handler) = @{$recv_commands{$cmd}}{qw(parser handler)};
+    if($parser eq 'custom') {
+        &$handler($self, $client, $buf);
+    } else {
+        my @args = unpack($parser, $buf);
+        &$handler($self, $client, @args);
+    }
+    return $datalen + 8;
+}
+
+
+=head1 NETWORK PROTOCOL HANDLERS
+
+These are special methods which each handle a specific kind of received packet
+from the client device.
+
+=head2 handle_HELO
+
+This is a custom handler, the amount of data varies depending on the client
+type and version.
+
+=cut
+
+sub handle_HELO {
+    my ($self, $client, $data) = @_;
+    my %device_types = (
+        1  => 'slimp3', # not in the documentation, but this is my guess
+        2  => 'squeezebox',
+        3  => 'softsqueeze',
+        4  => 'squeezebox2',
+        5  => 'transporter',
+        6  => 'softsqueeze3',
+        7  => 'receiver',
+        8  => 'squeezeslave',
+        9  => 'controller',
+        10 => 'boom',
+        11 => 'softboom',
+        12 => 'squeezeplay',
+    );
+    my %display_types = (
+        squeezebox2   => '320x32',
+        softsqueeze3  => '320x32',
+    );
+    my $type = vec($data, 0, 8);
+    if(exists($device_types{$type})) {
+        $$client{type} = $device_types{$type};
+    } else {
+        $$client{type} = "unknown ($type)";
+    }
+    if(exists($display_types{$$client{type}})) {
+        $$client{display} = $display_types{$$client{type}};
+    } else {
+        $self->info("I don't know what kind of display client type $$client{type} has.\n");
+        $$client{display} = 'unknown';
+    }
+    $$client{revision} = vec($data, 1, 8);
+    $self->info("$$client{addr} is $$client{type} version $$client{revision}.\n");
+    $$client{mac}      = sprintf("%02x" x 6, unpack("C6", substr($data, 2, 6)));
+    my $mac            = $$client{mac};
+    my $offset = 8;
+    # insert more parsing here if we ever care about the remaining fields
+    #$self->hexdump($data);
+    # reply with our version
+#    $self->send_version($client, "MiniSlim-$VERSION");
+
+    # load per-client state.
+    $$client{playlist}   = $self->perclient_config($mac, 'playlist'  , [@{$$self{args}}]);
+    $$client{pl_pos}     = $self->perclient_config($mac, 'pl_pos'    , 0);
+    $$client{volume}     = $self->perclient_config($mac, "volume"    , 10);
+    $$client{brightness} = $self->perclient_config($mac, "brightness", 3);
+    $$client{repeatrate} = 200;
+
+    $self->send_version($client, "6.5.4");
+    $self->send_aude($client);
+    $self->send_audg($client);
+    $self->schedule_work(\&setup_display, $self, $client)
+        if($$client{display} ne 'unknown');
+    $self->stop($client);
+    $self->schedule_work(\&play, $self, $client);
+    return 0;
+}
+
+
+=head2 handle_STAT
+
+This is a custom handler, the amount of data varies depending on the event type.
+
+=cut
+
+sub handle_STAT {
+    my ($self, $client, $data) = @_;
+    my ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
+        $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
+        $serverts, $error, $parsed);
+    $parsed = 0;
+    my $datalen = length($data);
+    if($datalen == 43) {
+        # This is the format my squeezebox2 always seems to send.
+        $event = '';
+        my @list = unpack("A4CCCNNQnNNNNn", $data);
+        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
+            $jiffies, $outbufsize, $outbuffull, $tracksec, $error) = @list;
+        $parsed = 1;
+    }
+    elsif($datalen == 51) {
+        # This is the format softsqueeze always seems to send.
+        $event = '';
+        my @list = unpack("A4CCCNNQnNNNNnNN", $data);
+        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
+            $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
+            $serverts) = @list;
+        $parsed = 1;
+    } else {
+        $self->info("got to handle_STAT: length = $datalen\n");
+        $self->hexdump($data);
+    }
+    if($parsed) {
+        my $percent;
+        if($buffull) {
+            $percent = ($buffull / $bufsize);
+            $percent = int($percent * 20) + 1;
+        } else {
+            $percent = 0;
+        }
+        my $output = "$event inbuf[";
+        $output .= '*' x $percent;
+        $output .= '.' x (20-$percent);
+        $output .= "]";
+        if($outbuffull) {
+            $percent = ($outbuffull / $outbufsize);
+            $percent = int($percent * 20) + 1;
+        } else {
+            $percent = 0;
+        }
+        $output .= " outbuf[";
+        $output .= '*' x $percent;
+        $output .= '.' x (20-$percent);
+        $output .= "]";
+#        $self->info("$output\n");
+        my %event_state_map = (
+            'STMd' => 'need next track',
+            'STMp' => 'paused',
+            'STMr' => 'playing',
+            'STMs' => 'playing',
+            'STMu' => 'stopped',
+        );
+        if(exists($event_state_map{$event})) {
+            my $state = $event_state_map{$event};
+            if($state eq 'need next track') {
+                $self->skip_next($client);
+            } else {
+                $$client{state} = $state;
+                if($state eq 'playing') {
+                    if($$client{display} ne 'unknown') {
+                        $self->schedule_work(\&update_track_name, $self, $client);
+                        $self->schedule_work(\&update_playlist_pos, $self, $client);
+                        $self->schedule_work(\&update_display, $self, $client);
+                    }
+                }
+            }
+        }
+        if($event eq 'STMt') {
+            $$client{trackpos} = $tracksec;
+            if($$client{display} ne 'unknown') {
+                $self->schedule_work(\&update_track_pos, $self, $client);
+                $self->schedule_work(\&update_display, $self, $client);
+            }
+        }
+        return 0;
+    }
+    return -1;
+}
+
+
+=head2 handle_RESP
+
+This is a handler for http responses.  Essentially we just ignore it for now.
+
+=cut
+
+sub handle_RESP {
+    my ($self, $client, $resp) = @_;
+}
+
+
+=head2 handle_DSCO
+
+This is a handler for stream disconnection notifications.  Essentially we just
+ignore it for now.
+
+=cut
+
+sub handle_DSCO {
+    my ($self, $client, $arg) = @_;
+}
+
+
+=head2 handle_IR
+
+This is a handler for remote control keypresses.
+
+=cut
+
+sub handle_IR {
+    my ($self, $client, $timestamp, $format, $length, $vendor, $rkey, $ck) = @_;
+    if($vendor != 0x7689) {
+        $self->info("IR vendor $vendor unknown, event dropped.\n");
+        return -1;
+    }
+    if(($rkey ^ $ck) != 0xff) {
+        $self->info("checksum mismatch, key $rkey dropped.\n");
+        return -1;
+    }
+    my $key = 0;
+    # IR keys are received in reverse bit order.  re-reverse them to get the
+    # original keycodes.
+    foreach my $bit (0..7) {
+        $key |= (($rkey & (1<<$bit)) >> $bit) << (7-$bit);
+    }
+
+    # keynames in keycode order.
+    my @squeezebox_remote_keys = qw(
+        voldown volup power
+        rewind pause fastfwd
+        add up play
+        left unknown right
+        unknown down browse
+        1 2 3 4 5 6 7 8 9
+        favorites 0 search
+        shuffle repeat sleep
+        nowplaying size brightness
+    );
+    if(!exists($squeezebox_remote_keys[$key])) {
+        $self->info("Unknown key pressed, key $key dropped.\n");
+        return -1;
+    }
+    return $self->handle_keypress($client, $squeezebox_remote_keys[$key], $timestamp);
+}
+
 
 =head1 TRANSMIT PATH
 
@@ -319,7 +828,7 @@ sub send_packet {
     my $len = length($payload) + 4;
     $len = pack("n", $len);
     my $packet = $len . $type . $payload;
-    $self->info("sending '$type'\n");
+#    $self->info("sending '$type'\n");
     $$client{sock}->print($packet);
     return length($packet);
 }
@@ -398,8 +907,30 @@ sub send_audg {
         dvc preamp
         new_left new_right
     )});
-    $self->hexdump($packet);
     return $self->send_packet($client, 'audg', $packet);
+}
+
+sub send_grfb {
+    my ($self, $client, %args) = @_;
+    my %defaults = (
+        level => 3,
+    );
+    my %values = ( %defaults, %args );
+    my $packet = pack('n',@values{qw(level)});
+    return $self->send_packet($client, 'grfb', $packet);
+}
+
+sub send_grfe {
+    my ($self, $client, %args) = @_;
+    my %defaults = (
+        offset     => 0,
+        transition => 'c',
+        param      => 0,
+        data       => '',
+    );
+    my %values = ( %defaults, %args );
+    my $packet = pack('nAC',@values{qw(offset transition param)}) . $values{data};
+    return $self->send_packet($client, 'grfe', $packet);
 }
 
 sub send_visu {
@@ -473,7 +1004,6 @@ sub send_visu {
         return -1;
     }
     my $packet = pack($packval, @values);
-    $self->info("sending visu\n");
     return $self->send_packet($client, 'visu', $packet);
 }
 
@@ -483,290 +1013,32 @@ sub send_version {
 }
 
 
-=head1 RECEIVE PATH
+=head1 MISC GUTS
 
-=head2 handle_listener_read
+=head2 find_track_len
 
-The listener socket got a new connection, set up the new client.
-
-=cut
-
-sub handle_listener_read {
-    my ($self, $listener) = @_;
-    my $socket = $listener->accept();
-    if(!defined($socket)) {
-        $self->info("Listener socket couldn't accept new connection.\n");
-        return;
-    }
-    my $fd   = $socket->fileno();
-    my $addr = $socket->peerhost();
-    $self->info("Received client connection from $addr\n");
-    $$self{clients}{$fd} = {
-        sock       => $socket,
-        connected  => time(),
-        peername   => $addr,
-        inbuf      => '',
-        fd         => $fd,
-        state      => 'pending',
-    };
-    $$self{sel}->add($socket);
-}
-
-
-=head2 handle_client_read
-
-The client socket sent us some data, handle it.
+Given a filename, scan the file to try to find its length (in seconds).
 
 =cut
 
-sub handle_client_read {
-    my ($self, $socket) = @_;
-    my $fd     = $socket->fileno();
-    my $client = $$self{clients}{$fd};
-    # append to current inbuf
-    my $rv     = $socket->sysread($$client{inbuf}, 4096, length($$client{inbuf}));
-    if($rv < 0) {
-        $self->info("Client read returned $rv ($!)\n");
-        return;
-    } elsif(!$rv) {
-        $self->info("Got EOF from client " . $$client{peername} . "\n");
-        $$client{dead} = 1; # for timer callbacks
-        $$self{sel}->remove($socket);
-        delete($$self{clients}{$fd});
-        return;
+sub find_track_len {
+    my ($self, $client, $fn) = @_;
+    my ($ext) = ($fn =~ /\.([^\/]+)$/);
+    return unless defined $ext;
+    $ext = lc($ext);
+    if($ext eq 'flac') {
+        return unless $have_audio_flac_header;
+        my $header = Audio::FLAC::Header->new($fn);
+        return unless defined $header;
+        my $seconds = $header->info->{TOTALSAMPLES} / $header->info->{SAMPLERATE};
+        $$client{tracklen} = $seconds;
     }
-    while($self->handle_client_command($client) > 0) {}
-}
-
-
-=head2 handle_client_command
-
-The client socket sent us some data.  Check whether a command has been fully
-received, and if so, dispatch to the right command handler.
-
-Returns the number of bytes consumed.
-
-=cut
-
-our %recv_commands = (
-    'HELO' => { parser => 'custom', handler => \&handle_HELO },
-    'STAT' => { parser => 'custom', handler => \&handle_STAT },
-    'RESP' => { parser => 'A*'    , handler => \&handle_RESP },
-    'IR'   => { parser => 'NCCnCC', handler => \&handle_IR },
-    'DSCO' => { parser => 'C'     , handler => \&handle_DSCO },
-);
-sub handle_client_command {
-    my ($self, $client) = @_;
-    my $addr = $$client{peername};
-    my $buf  = $$client{inbuf};
-    my $blen = length($buf);
-    return 0 if $blen < 8;
-    my ($cmd, $datalen) = unpack("A4N", $buf);
-    return 0 if $blen < (8 + $datalen);
-    # the full packet has arrived, remove it from the inbuf.
-    $buf = substr($$client{inbuf}, 0, $datalen + 8, '');
-    $buf = substr($buf, 8); # ... and strip off the command/size prefix
-    if(!exists($recv_commands{$cmd})) {
-        $self->info("$addr: I don't know how to handle command $cmd (len $datalen).\n");
-        return -1;
+    if($ext eq 'mp3') {
+        return unless $have_mp3_info;
+        my $header = MP3::Info->new($fn);
+        return unless defined $header;
+        $$client{tracklen} = $header->{SECS};
     }
-    my ($parser, $handler) = @{$recv_commands{$cmd}}{qw(parser handler)};
-    if($parser eq 'custom') {
-        &$handler($self, $client, $buf);
-    } else {
-        my @args = unpack($parser, $buf);
-        &$handler($self, $client, @args);
-    }
-    return $datalen + 8;
-}
-
-
-=head1 NETWORK PROTOCOL HANDLERS
-
-These are special methods which each handle a specific kind of received packet
-from the client device.
-
-=head2 handle_HELO
-
-This is a custom handler, the amount of data varies depending on the client
-type and version.
-
-=cut
-
-sub handle_HELO {
-    my ($self, $client, $data) = @_;
-    $self->info("got to handle_HELO\n");
-    my %device_types = (
-        2  => 'squeezebox',
-        3  => 'softsqueeze',
-        4  => 'squeezebox2',
-        5  => 'transporter',
-        6  => 'softsqueeze3',
-        7  => 'receiver',
-        8  => 'squeezeslave',
-        9  => 'controller',
-        10 => 'boom',
-        11 => 'softboom',
-        12 => 'squeezeplay',
-    );
-    my $type = vec($data, 0, 8);
-    if(exists($device_types{$type})) {
-        $$client{type} = $device_types{$type};
-    } else {
-        $$client{type} = "unknown ($type)";
-    }
-    $$client{revision} = vec($data, 1, 8);
-    $$client{mac}      = sprintf("%02x" x 6, unpack("C6", substr($data, 2, 6)));
-    my $mac            = $$client{mac};
-    my $offset = 8;
-    # insert more parsing here if we ever care about the remaining fields
-    #$self->hexdump($data);
-    # reply with our version
-#    $self->send_version($client, "MiniSlim-$VERSION");
-
-    # load per-client state.
-    $$client{playlist}   = $self->perclient_config($mac, 'playlist', [@{$$self{args}}]);
-    $$client{pl_pos}     = $self->perclient_config($mac, 'pl_pos',   0);
-    $$client{volume}     = $self->perclient_config($mac, "volume",   10);
-    $$client{repeatrate} = 200;
-
-    $self->send_version($client, "6.5.4");
-    $self->send_aude($client);
-    $self->send_audg($client);
-    $self->send_visu($client, which => 0);
-    $self->send_visu($client, which => 2);
-    $self->play($client);
-    return 0;
-}
-
-
-=head2 handle_STAT
-
-This is a custom handler, the amount of data varies depending on the event type.
-
-=cut
-
-sub handle_STAT {
-    my ($self, $client, $data) = @_;
-    my ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
-        $jiffies, $outbufsize, $outbuffull, $ts, $error);
-    if(length($data) == 43) {
-        # The docs say this is variable length, but this is the only one I've seen.
-        $event = '';
-        my @list = unpack("A4CCCNNQnNNNNn", $data);
-        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
-            $jiffies, $outbufsize, $outbuffull, $ts, $error) = @list;
-        my $percent;
-        if($buffull) {
-            $percent = ($buffull / $bufsize);
-            $percent = int($percent * 20) + 1;
-        } else {
-            $percent = 0;
-        }
-        my $output = "$event inbuf[";
-        $output .= '*' x $percent;
-        $output .= '.' x (20-$percent);
-        $output .= "]";
-        if($outbuffull) {
-            $percent = ($outbuffull / $outbufsize);
-            $percent = int($percent * 20) + 1;
-        } else {
-            $percent = 0;
-        }
-        $output .= " outbuf[";
-        $output .= '*' x $percent;
-        $output .= '.' x (20-$percent);
-        $output .= "]";
-        $self->info("$output\n");
-    } else {
-        $self->info("got to handle_STAT\n");
-        $self->hexdump($data);
-    }
-    my %event_state_map = (
-        'STMd' => 'need next track',
-        'STMp' => 'paused',
-        'STMr' => 'playing',
-        'STMs' => 'playing',
-        'STMu' => 'stopped',
-    );
-    if(defined($event) && exists($event_state_map{$event})) {
-        my $state = $event_state_map{$event};
-        if($state eq 'need next track') {
-            $self->skip_next($client);
-        } else {
-            $$client{state} = $state;
-        }
-    }
-    return 0;
-}
-
-
-=head2 handle_RESP
-
-This is a handler for http responses.
-
-=cut
-
-sub handle_RESP {
-    my ($self, $client, $resp) = @_;
-#    $self->info("handle_RESP\n");
-#    $self->hexdump($resp);
-}
-
-
-=head2 handle_DSCO
-
-This is a handler for stream disconnection notifications.
-
-=cut
-
-sub handle_DSCO {
-    my ($self, $client, $arg) = @_;
-    $self->info("handle_DSCO\n");
-    $self->hexdump($arg);
-}
-
-
-=head2 handle_IR
-
-This is a handler for remote control keypresses.
-
-=cut
-
-sub handle_IR {
-    my ($self, $client, $timestamp, $format, $length, $vendor, $rkey, $ck) = @_;
-    if($vendor != 0x7689) {
-        $self->info("IR vendor $vendor unknown, event dropped.\n");
-        return -1;
-    }
-    if(($rkey ^ $ck) != 0xff) {
-        $self->info("checksum mismatch, key $rkey dropped.\n");
-        return -1;
-    }
-    my $key = 0;
-    # IR keys are received in reverse bit order.  re-reverse them to get the
-    # original keycodes.
-    foreach my $bit (0..7) {
-        $key |= (($rkey & (1<<$bit)) >> $bit) << (7-$bit);
-    }
-
-    # keynames in keycode order.
-    my @squeezebox_remote_keys = qw(
-        voldown volup power
-        rewind pause fastfwd
-        add up play
-        left unknown right
-        unknown down browse
-        1 2 3 4 5 6 7 8 9
-        favorites 0 search
-        shuffle repeat sleep
-        nowplaying size brightness
-    );
-    if(!exists($squeezebox_remote_keys[$key])) {
-        $self->info("Unknown key pressed, key $key dropped.\n");
-        return -1;
-    }
-    return $self->handle_keypress($client, $squeezebox_remote_keys[$key], $timestamp);
 }
 
 
@@ -776,6 +1048,12 @@ sub handle_IR {
 
 
 =head1 BUGS
+
+It works for me.  I have a device that (currently) reports itself as a
+squeezebox2 version 81.  There's no guarantee it will work for your device, or
+your firmware version.  That said, I'll happily consider applying patches that
+make it work with other models and versions.  Especially if those patches also
+contain test cases for the things your player does differently.
 
 Please report any bugs or feature requests to C<bug-mini-slim at rt.cpan.org>,
 or through the web interface at
@@ -793,34 +1071,23 @@ You might find additional information at:
 
 =over 4
 
+=item * Github: The source repository
+
+L<http://github.com/Infinoid/Mini-Slim>
+
 =item * RT: CPAN's request tracker
 
 L<http://rt.cpan.org/NoAuth/Bugs.html?Dist=Mini-Slim>
 
-=item * AnnoCPAN: Annotated CPAN documentation
-
-L<http://annocpan.org/dist/Mini-Slim>
-
-=item * CPAN Ratings
-
-L<http://cpanratings.perl.org/d/Mini-Slim>
-
-=item * Search CPAN
-
-L<http://search.cpan.org/dist/Mini-Slim/>
-
 =back
-
-
-=head1 ACKNOWLEDGEMENTS
 
 
 =head1 COPYRIGHT & LICENSE
 
 Copyright 2009 "Mark Glines", all rights reserved.
 
-This program is free software; you can redistribute it and/or modify it
-under the same terms as Perl itself.
+It is distributed under the terms of the Artistic License 2.0.
+For more details, see the full text of the license in the file LICENSE.
 
 
 =cut

@@ -1,0 +1,12 @@
+* Save client state to a file, retrieve it at server start time.
+* Fix track skipping, it sometimes gets stuck streaming but not playing.
+* Implement track seeking.  (Seeking backwards might be hard for big files.)
+* Implement a popup volume bar.
+* Implement a popup seek bar.
+* Implement a file browser.
+* Implement a playlist browser/editor/selector.
+* Optimize update_display(), it's a CPU hot spot.
+* The softsqueeze3 app doesn't seem to work quite right, fix it.
+* Fix up the boilerplate tests, add some real tests.
+* Whittle down the CPAN requirements a bit more.
+* Release it to CPAN.

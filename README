@@ -1,25 +1,48 @@
 Mini-Slim
 
-The README is used to introduce the module and provide instructions on
-how to install the module, any machine dependencies it may have (for
-example C compilers and installed libraries) and any other information
-that should be provided before the module is installed.
+This is an alternative to squeezecenter, previously known as slimserver.  It is
+a fairly minimal server for slim devices (now logitech) products.
 
-A README file is required for CPAN modules since CPAN extracts the README
-file from a module distribution so that people browsing the archive
-can use it to get an idea of the module's uses. It is usually a good idea
-to provide version information here so that people can decide whether
-fixes for the module are worth downloading.
+I wrote it because I wanted my squeezebox2 to run from a small embedded device
+and was tired of squeezecenter trying to take up half a gig of RAM for no good
+reason.
+
+I don't intend to match squeezecenter's featureset, I'm just happy if
+I have a working player at 1% of the size.
+
+
+REQUIREMENTS
+
+To use this application, you will need a modern version of perl, and the CPAN
+modules mentioned in Build.PL.  You will also need direct filesystem access to
+the music files you intend to play.
+
+You will also a webserver running on port 80 on the same machine, which is
+configured to serve the same music files.  (Unlike squeezecenter, this
+application does not have a web server built in, but the player can stream
+music just fine from apache or lighttpd.)
 
 
 INSTALLATION
 
-To install this module, run the following commands:
+To install this application, run the following commands:
 
 	perl Build.PL
 	./Build
 	./Build test
 	./Build install
+
+CONFIGURATION
+
+The server reads configuration from /etc/mini-slim.conf and $HOME/.mini-slim.
+At a bare minimum, you will need to tell it how to get to your music, both via
+the local filesystem and via the webserver.  If your music was at /media/music/
+in your local filesystem, and you could get to the same place in a web browser
+with "http://localhost/music/", you would use the following settings:
+
+    musicdir: /media/music
+    httpdir: /music
+
 
 SUPPORT AND DOCUMENTATION
 
@@ -28,25 +51,18 @@ perldoc command.
 
     perldoc Mini::Slim
 
-You can also look for information at:
+You might find additional information at:
+
+    Github, the source repository
+        http://github.com/Infinoid/Mini-Slim
 
     RT, CPAN's request tracker
         http://rt.cpan.org/NoAuth/Bugs.html?Dist=Mini-Slim
-
-    AnnoCPAN, Annotated CPAN documentation
-        http://annocpan.org/dist/Mini-Slim
-
-    CPAN Ratings
-        http://cpanratings.perl.org/d/Mini-Slim
-
-    Search CPAN
-        http://search.cpan.org/dist/Mini-Slim/
 
 
 COPYRIGHT AND LICENCE
 
 Copyright (C) 2009 "Mark Glines"
 
-This program is free software; you can redistribute it and/or modify it
-under the same terms as Perl itself.
-
+It is distributed under the terms of the Artistic License 2.0.
+For more details, see the full text of the license in the file LICENSE.
