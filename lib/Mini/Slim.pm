@@ -671,14 +671,21 @@ sub handle_STAT {
     $parsed = 0;
     my $datalen = length($data);
     if($datalen == 43) {
-        # This is the format my squeezebox2 always seems to send.
+        # Some older squeezebox2 firmware format.
         $event = '';
         my @list = unpack("A4CCCNNQnNNNNn", $data);
         ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
             $jiffies, $outbufsize, $outbuffull, $tracksec, $error) = @list;
         $parsed = 1;
-    }
-    elsif($datalen == 51) {
+    } elsif($datalen == 53) {
+        # Updated format of squeezebox2 with late 2009 firmware
+        $event = '';
+        my @list = unpack("A4CCCNNQnNNNNnNNn", $data);
+        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
+            $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
+            $serverts, $error) = @list;
+        $parsed = 1;
+    } elsif($datalen == 51) {
         # This is the format softsqueeze always seems to send.
         $event = '';
         my @list = unpack("A4CCCNNQnNNNNnNN", $data);
