@@ -678,7 +678,7 @@ sub handle_STAT {
             $jiffies, $outbufsize, $outbuffull, $tracksec, $error) = @list;
         $parsed = 1;
     } elsif($datalen == 53) {
-        # Updated format of squeezebox2 with late 2009 firmware
+        # squeezebox2 version 130.
         $event = '';
         my @list = unpack("A4CCCNNQnNNNNnNNn", $data);
         ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
