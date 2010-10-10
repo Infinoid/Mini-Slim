@@ -665,32 +665,32 @@ This is a custom handler, the amount of data varies depending on the event type.
 
 sub handle_STAT {
     my ($self, $client, $data) = @_;
-    my ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
-        $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
+    my ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamedH, $streamedL,
+        $signal, $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
         $serverts, $error, $parsed);
     $parsed = 0;
     my $datalen = length($data);
     if($datalen == 43) {
         # Some older squeezebox2 firmware format.
         $event = '';
-        my @list = unpack("A4CCCNNQnNNNNn", $data);
-        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
-            $jiffies, $outbufsize, $outbuffull, $tracksec, $error) = @list;
+        my @list = unpack("A4CCCN4nNNNNn", $data);
+        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamedH, $streamedL,
+         $signal, $jiffies, $outbufsize, $outbuffull, $tracksec, $error) = @list;
         $parsed = 1;
     } elsif($datalen == 53) {
         # squeezebox2 version 130.
         $event = '';
-        my @list = unpack("A4CCCNNQnNNNNnNNn", $data);
-        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
-            $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
+        my @list = unpack("A4CCCN4nNNNNnNNn", $data);
+        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamedH, $streamedL,
+         $signal, $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
             $serverts, $error) = @list;
         $parsed = 1;
     } elsif($datalen == 51) {
         # This is the format softsqueeze always seems to send.
         $event = '';
-        my @list = unpack("A4CCCNNQnNNNNnNN", $data);
-        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamed, $signal,
-            $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
+        my @list = unpack("A4CCCN4nNNNNnNN", $data);
+        ($event, $crlf, $minit, $mmode, $bufsize, $buffull, $streamedH, $streamedL,
+         $signal, $jiffies, $outbufsize, $outbuffull, $tracksec, $voltage, $trackmsec,
             $serverts) = @list;
         $parsed = 1;
     } else {
