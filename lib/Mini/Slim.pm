@@ -285,6 +285,7 @@ sub key_volume_handler {
         $$client{volume} = $volume;
         $self->send_audg($client);
         $self->update_volume_display($client);
+        $self->update_display($client);
         return 0;
     } else {
         $self->info("limiting volume to $$client{volume}\n");
