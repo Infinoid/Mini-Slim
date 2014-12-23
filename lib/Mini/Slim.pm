@@ -331,8 +331,8 @@ sub key_seek_handler {
         $$state{unit}  = 1;
         $self->schedule_work(\&key_seek_timer, $self, $client, $key);
     } else {
-        # if the button is held for more than a second, it's a seek, not a skip.
-        if(tv_interval($$state{begin}) >= 1) {
+        # if the button is held for more than a half second, it's a seek, not a skip.
+        if(tv_interval($$state{begin}) >= 0.5) {
             if($mode eq 'track') {
                 $$state{mode} = 'seek';
             } else {
@@ -359,11 +359,31 @@ sub key_seek_timer {
             } elsif($key eq 'fastfwd') {
                 $self->skip_next($client);
             }
+            $self->update_trackchange_display($client);
+            $self->update_display($client);
+            if(!exists($$client{trackchange})) {
+                $self->schedule_work(\&track_change_timer, $self, $client);
+            }
+            $$client{trackchange} = 20;
         }
         $$state{mode} = 'done';
     } else {
         # reschedule ourselves to check again later.
         $self->schedule_work(\&key_seek_timer, $self, $client, $key);
+    }
+}
+
+sub track_change_timer {
+    my ($self, $client) = @_;
+    return if exists $$client{dead};
+    if($$client{trackchange} > 0) {
+        $$client{display} = $$client{displays}{trackchange};
+        $$client{trackchange}--;
+        $self->schedule_work(\&track_change_timer, $self, $client);
+    } else {
+        delete($$client{trackchange});
+        # FIXME: detect whether we should return to another overlay
+        $$client{display} = $$client{displays}{playback};
     }
 }
 
@@ -394,7 +414,7 @@ sub setup_display {
     $$client{ysize} = $ysize;
     $self->info("setup_display: $xsize x $ysize\n");
     $$client{displays} = {};
-    for my $displayname ('playback', 'volume') {
+    for my $displayname ('playback', 'volume', 'trackchange') {
         my $display = $$client{displays}{$displayname} = {};
         $$display{gd} = GD::Image->new($xsize, $ysize);
         $$display{gd_white} = $$display{gd}->colorAllocate(255,255,255);
@@ -568,7 +588,7 @@ sub update_playlist_pos {
 }
 
 
-=head2 update_volume
+=head2 update_volume_display
 
 Re-draw the volume display.
 
@@ -583,6 +603,23 @@ sub update_volume_display {
     $self->render_text_at($display, 0, 0, 239, 12, "Volume: $volume/$maxvol");
     my $full = $volume / $maxvol;
     $self->render_bar_at($display, 20, 15, $$client{xsize}-20, $$client{ysize}-3, $full);
+}
+
+
+=head2 update_trackchange_display
+
+Re-draw the trackchange display.
+
+=cut
+
+sub update_trackchange_display {
+    my ($self, $client) = @_;
+    my $display = $$client{displays}{trackchange};
+    my $pos = $$client{pl_pos} + 1;
+    my $total = scalar @{$$client{playlist}};
+    my $fn = basename($$client{playlist}[$$client{pl_pos}]);
+    $self->render_text_at($display, 20, 3 , $$client{xsize}, 14, "Skipping to track $pos (of $total)");
+    $self->render_text_at($display, 20, 15, $$client{xsize}, $$client{ysize}, $fn);
 }
 
 
@@ -708,16 +745,16 @@ sub handle_HELO {
     # insert more parsing here if we ever care about the remaining fields
     #$self->hexdump($data);
     # reply with our version
-#    $self->send_version($client, "MiniSlim-$VERSION");
+    $self->send_version($client, "MiniSlim-$VERSION");
 
     # load per-client state.
     $$client{playlist}   = $self->perclient_config($mac, 'playlist'  , [@{$$self{args}}]);
     $$client{pl_pos}     = $self->perclient_config($mac, 'pl_pos'    , 0);
     $$client{volume}     = $self->perclient_config($mac, 'volume'    , 10);
     $$client{brightness} = $self->perclient_config($mac, 'brightness', 3);
-    $$client{repeatrate} = 200;
+    $$client{repeatrate} = 100;
 
-    $self->send_version($client, "6.5.4");
+#    $self->send_version($client, "6.5.4");
     $self->send_aude($client);
     $self->send_audg($client);
     $self->schedule_work(\&setup_display, $self, $client)
