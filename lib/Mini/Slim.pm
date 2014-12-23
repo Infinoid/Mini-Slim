@@ -374,10 +374,13 @@ sub setup_display {
     $$client{xsize} = $xsize;
     $$client{ysize} = $ysize;
     $self->info("setup_display: $xsize x $ysize\n");
-    $$client{gd} = GD::Image->new($xsize, $ysize);
-    $$client{gd_white} = $$client{gd}->colorAllocate(255,255,255);
-    $$client{gd_black} = $$client{gd}->colorAllocate(0,0,0);
-    $$client{gd}->filledRectangle(0, 0, $xsize-1, $ysize-1, $$client{gd_black});
+    $$client{displays} = {};
+    my $playback = $$client{displays}{playback} = {};
+    $$playback{gd} = GD::Image->new($xsize, $ysize);
+    $$playback{gd_white} = $$playback{gd}->colorAllocate(255,255,255);
+    $$playback{gd_black} = $$playback{gd}->colorAllocate(0,0,0);
+    $$playback{gd}->filledRectangle(0, 0, $xsize-1, $ysize-1, $$playback{gd_black});
+    $$client{display} = $playback;
 }
 
 =head2 update_display
@@ -394,13 +397,12 @@ sub update_display {
     my $xsize     = $$client{xsize};
     my $ysize     = $$client{ysize};
     my $xstart    = 0;
-    my $xend      = $xsize - 1;
     my $colshiftB = ${ {
         32 => 2, # 32 bits = 4 bytes = 1<<2
     }}{$ysize};
     my $colshiftb = $colshiftB + 3;
     my $outbuf;
-    my $wbmp      = $$client{gd}->wbmp($$client{gd_black});
+    my $wbmp      = $$client{display}{gd}->wbmp($$client{display}{gd_black});
     # strip off header
     substr($wbmp, 0, 5, '');
     my @wbmp_yboffsets = map {
@@ -408,10 +410,10 @@ sub update_display {
     } (0..$ysize-1);
     my @wbmp_xboffsets = map {
         ($_+7) - (($_ & 7) << 1)
-    } (0..$xend-1);
+    } (0..$xsize-1);
     my @wbmp_yBoffsets = map { $_ >> 3 } (@wbmp_yboffsets);
     my $x = $xstart;
-    while($x < $xend) {
+    while($x < $xsize) {
         my $outbuf_column_offset = ($x-$xstart) << $colshiftb;
 #        if((!($x & 0x7)) && (($xend - $x) >= 8)) {
 #            # handle whole bytes at a time.
@@ -451,10 +453,10 @@ Render text on the client's display.
 =cut
 
 sub render_text_at {
-    my ($self, $client, $x, $y, $xend, $yend, $text, $font) = @_;
+    my ($self, $display, $x, $y, $xend, $yend, $text, $font) = @_;
     $font = GD::Font->Small() unless defined $font;
-    $$client{gd}->filledRectangle($x, $y, $xend, $yend, $$client{gd_black});
-    $$client{gd}->string($font, $x+1, $y, $text, $$client{gd_white});
+    $$display{gd}->filledRectangle($x, $y, $xend, $yend, $$display{gd_black});
+    $$display{gd}->string($font, $x+1, $y, $text, $$display{gd_white});
 }
 
 =head2 update_track_pos
@@ -465,26 +467,27 @@ Updates the track position and playback progress bar.
 
 sub update_track_pos {
     my ($self, $client) = @_;
+    my $playback = $$client{displays}{playback};
     my $seconds = $$client{trackpos};
     my $seconds_part = $seconds % 60;
     my $minutes_part = ($seconds - $seconds_part) / 60;
     $seconds_part = "0$seconds_part" while length($seconds_part) < 2;
-    $self->render_text_at($client, 0, 0, 239, 12, "$minutes_part:$seconds_part");
+    $self->render_text_at($playback, 0, 0, 239, 12, "$minutes_part:$seconds_part");
     if(defined($$client{tracklen})) {
         my $tracklen = int($$client{tracklen});
         $seconds_part = $tracklen % 60;
         $minutes_part = ($tracklen - $seconds_part) / 60;
         $seconds_part = "0$seconds_part" while length($seconds_part) < 2;
-        $self->render_text_at($client, 190, 0, 239, 12, "$minutes_part:$seconds_part");
+        $self->render_text_at($playback, 190, 0, 239, 12, "$minutes_part:$seconds_part");
         my $full = $seconds / $$client{tracklen};
         $full *= (180-45);
-        $$client{gd}->arc(45 , 6, 6, 6, 90 , 270, $$client{gd_white});
-        $$client{gd}->arc(180, 6, 6, 6, 270, 90 , $$client{gd_white});
-        $$client{gd}->line(45, 3, 180, 3, $$client{gd_white});
-        $$client{gd}->line(45, 9, 180, 9, $$client{gd_white});
-        $$client{gd}->line(45, 3, 45 , 9, $$client{gd_white});
-        $$client{gd}->fill(44, 6, $$client{gd_white});
-        $$client{gd}->filledRectangle(45, 3, 45+$full, 9, $$client{gd_white});
+        $$playback{gd}->arc(45 , 6, 6, 6, 90 , 270, $$playback{gd_white});
+        $$playback{gd}->arc(180, 6, 6, 6, 270, 90 , $$playback{gd_white});
+        $$playback{gd}->line(45, 3, 180, 3, $$playback{gd_white});
+        $$playback{gd}->line(45, 9, 180, 9, $$playback{gd_white});
+        $$playback{gd}->line(45, 3, 45 , 9, $$playback{gd_white});
+        $$playback{gd}->fill(44, 6, $$playback{gd_white});
+        $$playback{gd}->filledRectangle(45, 3, 45+$full, 9, $$playback{gd_white});
     }
 }
 
@@ -496,10 +499,11 @@ Updates the track name on the LCD.
 
 sub update_track_name {
     my ($self, $client) = @_;
+    my $playback = $$client{displays}{playback};
     return unless $$client{state} eq 'playing';
     my $font = GD::Font->Large();
     my $track = $$client{playlist}[$$client{pl_pos}];
-    $self->render_text_at($client, 0, 15, 320, 31, basename($track), $font);
+    $self->render_text_at($playback, 0, 15, 320, 31, basename($track), $font);
 }
 
 =head2 update_playlist_pos
@@ -510,9 +514,10 @@ Updates the current position within the playlist.
 
 sub update_playlist_pos {
     my ($self, $client) = @_;
+    my $playback = $$client{displays}{playback};
     my $pos = $$client{pl_pos} + 1;
     my $total = scalar @{$$client{playlist}};
-    $self->render_text_at($client, 240, 0, 320, 12, "list: $pos/$total");
+    $self->render_text_at($playback, 240, 0, 320, 12, "list: $pos/$total");
 }
 
 
@@ -643,8 +648,8 @@ sub handle_HELO {
     # load per-client state.
     $$client{playlist}   = $self->perclient_config($mac, 'playlist'  , [@{$$self{args}}]);
     $$client{pl_pos}     = $self->perclient_config($mac, 'pl_pos'    , 0);
-    $$client{volume}     = $self->perclient_config($mac, "volume"    , 10);
-    $$client{brightness} = $self->perclient_config($mac, "brightness", 3);
+    $$client{volume}     = $self->perclient_config($mac, 'volume'    , 10);
+    $$client{brightness} = $self->perclient_config($mac, 'brightness', 3);
     $$client{repeatrate} = 200;
 
     $self->send_version($client, "6.5.4");
