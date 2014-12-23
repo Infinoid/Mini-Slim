@@ -752,7 +752,7 @@ sub handle_HELO {
     $$client{pl_pos}     = $self->perclient_config($mac, 'pl_pos'    , 0);
     $$client{volume}     = $self->perclient_config($mac, 'volume'    , 10);
     $$client{brightness} = $self->perclient_config($mac, 'brightness', 3);
-    $$client{repeatrate} = 100;
+    $$client{repeatrate} = 200;
 
 #    $self->send_version($client, "6.5.4");
     $self->send_aude($client);
