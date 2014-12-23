@@ -278,13 +278,31 @@ sub key_volume_handler {
     my ($self, $client, $ts, $key) = @_;
     my $delta = ($key eq 'volup') ? 1 : -1;
     my $volume = $$client{volume} + $delta;
+    $self->schedule_work(\&key_volume_timer, $self, $client)
+        unless exists($$client{volumedialog});
+    $$client{volumedialog} = 20;
     if(0 <= $volume && $volume < 128) {
         $$client{volume} = $volume;
         $self->send_audg($client);
+        $self->update_volume_display($client);
         return 0;
     } else {
         $self->info("limiting volume to $$client{volume}\n");
         return -1;
+    }
+}
+
+sub key_volume_timer {
+    my ($self, $client) = @_;
+    return if exists $$client{dead};
+    if($$client{volumedialog} > 0) {
+        $$client{display} = $$client{displays}{volume};
+        $$client{volumedialog}--;
+        $self->schedule_work(\&key_volume_timer, $self, $client);
+    } else {
+        delete($$client{volumedialog});
+        # FIXME: detect whether we should return to another overlay
+        $$client{display} = $$client{displays}{playback};
     }
 }
 
@@ -361,7 +379,7 @@ sub key_brightness_handler {
 
 =head2 setup_display
 
-Set up the client's display.
+Set up the displays for this client.
 
 =cut
 
@@ -375,12 +393,14 @@ sub setup_display {
     $$client{ysize} = $ysize;
     $self->info("setup_display: $xsize x $ysize\n");
     $$client{displays} = {};
-    my $playback = $$client{displays}{playback} = {};
-    $$playback{gd} = GD::Image->new($xsize, $ysize);
-    $$playback{gd_white} = $$playback{gd}->colorAllocate(255,255,255);
-    $$playback{gd_black} = $$playback{gd}->colorAllocate(0,0,0);
-    $$playback{gd}->filledRectangle(0, 0, $xsize-1, $ysize-1, $$playback{gd_black});
-    $$client{display} = $playback;
+    for my $displayname ('playback', 'volume') {
+        my $display = $$client{displays}{$displayname} = {};
+        $$display{gd} = GD::Image->new($xsize, $ysize);
+        $$display{gd_white} = $$display{gd}->colorAllocate(255,255,255);
+        $$display{gd_black} = $$display{gd}->colorAllocate(0,0,0);
+        $$display{gd}->filledRectangle(0, 0, $xsize-1, $ysize-1, $$display{gd_black});
+    }
+    $$client{display} = $$client{displays}{playback};
 }
 
 =head2 update_display
@@ -459,9 +479,42 @@ sub render_text_at {
     $$display{gd}->string($font, $x+1, $y, $text, $$display{gd_white});
 }
 
+
+=head2 render_bar_at
+
+Render a progress bar on the client's display.  The "value" should be a
+decimal in the range 0 to 1, inclusive.
+
+=cut
+
+sub render_bar_at {
+    my ($self, $display, $x, $y, $xend, $yend, $value) = @_;
+    my $diameter = $yend - $y;
+    my $radius = ($diameter) / 2;
+    my $full = int($value * ($xend-$x));
+    # clear old data
+    $$display{gd}->filledRectangle($x, $y, $xend, $yend, $$display{gd_black});
+    # left end
+    $$display{gd}->arc($x   +$radius, $y+$radius, $diameter, $diameter, 90 , 270, $$display{gd_white});
+    # right end
+    $$display{gd}->arc($xend-$radius, $y+$radius, $diameter, $diameter, 270, 90 , $$display{gd_white});
+    # connecting line above
+    $$display{gd}->line($x+$radius, $y   , $xend-$radius, $y   , $$display{gd_white});
+    # connecting line below
+    $$display{gd}->line($x+$radius, $yend, $xend-$radius, $yend, $$display{gd_white});
+    # ensure some edge cases (so that we can fill safely)
+    $$display{gd}->line($x   , $y+$radius, $xend  , $y+$radius, $$display{gd_white});
+    $$display{gd}->line($x+1 , $y+$radius, $xend-1, $y+$radius, $$display{gd_black});
+    # vertical line to bound the filled region
+    $$display{gd}->line($x+$full, $y, $x+$full, $yend, $$display{gd_white});
+    if($full > 0) {
+        $$display{gd}->fill($x+$full-1, $y+$radius, $$display{gd_white});
+    }
+}
+
 =head2 update_track_pos
 
-Updates the track position and playback progress bar.
+Updates the track position and playback progress bar on the playback display.
 
 =cut
 
@@ -480,20 +533,13 @@ sub update_track_pos {
         $seconds_part = "0$seconds_part" while length($seconds_part) < 2;
         $self->render_text_at($playback, 190, 0, 239, 12, "$minutes_part:$seconds_part");
         my $full = $seconds / $$client{tracklen};
-        $full *= (180-45);
-        $$playback{gd}->arc(45 , 6, 6, 6, 90 , 270, $$playback{gd_white});
-        $$playback{gd}->arc(180, 6, 6, 6, 270, 90 , $$playback{gd_white});
-        $$playback{gd}->line(45, 3, 180, 3, $$playback{gd_white});
-        $$playback{gd}->line(45, 9, 180, 9, $$playback{gd_white});
-        $$playback{gd}->line(45, 3, 45 , 9, $$playback{gd_white});
-        $$playback{gd}->fill(44, 6, $$playback{gd_white});
-        $$playback{gd}->filledRectangle(45, 3, 45+$full, 9, $$playback{gd_white});
+        $self->render_bar_at($playback, 44, 3, 180, 9, $full);
     }
 }
 
 =head2 update_track_name
 
-Updates the track name on the LCD.
+Updates the track name on the playback display.
 
 =cut
 
@@ -508,7 +554,7 @@ sub update_track_name {
 
 =head2 update_playlist_pos
 
-Updates the current position within the playlist.
+Updates the current track position on the playback display.
 
 =cut
 
@@ -517,7 +563,25 @@ sub update_playlist_pos {
     my $playback = $$client{displays}{playback};
     my $pos = $$client{pl_pos} + 1;
     my $total = scalar @{$$client{playlist}};
-    $self->render_text_at($playback, 240, 0, 320, 12, "list: $pos/$total");
+    $self->render_text_at($playback, 240, 0, 320, 12, "track $pos/$total");
+}
+
+
+=head2 update_volume
+
+Re-draw the volume display.
+
+=cut
+
+sub update_volume_display {
+    my ($self, $client) = @_;
+    my $display = $$client{displays}{volume};
+    my $volume = $$client{volume};
+    my $minvol = 0;
+    my $maxvol = 127;
+    $self->render_text_at($display, 0, 0, 239, 12, "Volume: $volume/$maxvol");
+    my $full = $volume / $maxvol;
+    $self->render_bar_at($display, 20, 15, $$client{xsize}-20, $$client{ysize}-3, $full);
 }
 
 

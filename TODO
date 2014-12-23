@@ -4,7 +4,7 @@ Things that work:
 * Rendering some nice things on the screen as it plays
 * Pause / resume
 * Skip to previous / next track
-* Volume up/down
+* Volume up/down with a nice popup display
 * Brightness
 
 Things that don't work yet:
@@ -12,7 +12,6 @@ Things that don't work yet:
 * Save client state to a file, retrieve it at server start time.
 * Fix track skipping, it sometimes gets stuck streaming but not playing.
 * Implement track seeking.  (Seeking backwards might be hard for big files.)
-* Implement a popup volume bar.
 * Implement a popup seek bar.
 * Implement a playlist browser/editor/selector.
 * Optimize update_display(), it's a CPU hot spot.
