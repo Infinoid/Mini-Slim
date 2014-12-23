@@ -1127,7 +1127,7 @@ sub find_track_len {
 =head1 BUGS
 
 It works for me.  I have a device that (currently) reports itself as a
-squeezebox2 version 81.  There's no guarantee it will work for your device, or
+squeezebox2 version 130.  There's no guarantee it will work for your device, or
 your firmware version.  That said, I'll happily consider applying patches that
 make it work with other models and versions.  Especially if those patches also
 contain test cases for the things your player does differently.
@@ -1172,7 +1172,7 @@ It isn't always accurate, but it's a whole lot better than nothing.
 
 =head1 COPYRIGHT & LICENSE
 
-Copyright 2009 "Mark Glines", all rights reserved.
+Copyright 2009, 2014 "Mark Glines", all rights reserved.
 
 It is distributed under the terms of the Artistic License 2.0.
 For more details, see the full text of the license in the file LICENSE.
