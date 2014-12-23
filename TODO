@@ -3,7 +3,7 @@ Things that work:
 * Pointing the squeezebox at a local apache server to play files
 * Rendering some nice things on the screen as it plays
 * Pause / resume
-* Skip to previous / next track
+* Skip to previous / next track with a nice popup display
 * Volume up/down with a nice popup display
 * Brightness
 

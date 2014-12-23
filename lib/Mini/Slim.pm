@@ -510,6 +510,8 @@ decimal in the range 0 to 1, inclusive.
 
 sub render_bar_at {
     my ($self, $display, $x, $y, $xend, $yend, $value) = @_;
+    $value = 0 if $value < 0;
+    $value = 1 if $value > 1;
     my $diameter = $yend - $y;
     my $radius = ($diameter) / 2;
     my $full = int($value * ($xend-$x));
