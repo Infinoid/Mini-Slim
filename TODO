@@ -1,9 +1,19 @@
+Things that work:
+* Accepting some music filenames on the command line
+* Pointing the squeezebox at a local apache server to play files
+* Rendering some nice things on the screen as it plays
+* Pause / resume
+* Skip to previous / next track
+* Volume up/down
+* Brightness
+
+Things that don't work yet:
+* Implement a file browser, or some minimal way to modify the playlist at runtime.
 * Save client state to a file, retrieve it at server start time.
 * Fix track skipping, it sometimes gets stuck streaming but not playing.
 * Implement track seeking.  (Seeking backwards might be hard for big files.)
 * Implement a popup volume bar.
 * Implement a popup seek bar.
-* Implement a file browser.
 * Implement a playlist browser/editor/selector.
 * Optimize update_display(), it's a CPU hot spot.
 * The softsqueeze3 app doesn't seem to work quite right, fix it.
