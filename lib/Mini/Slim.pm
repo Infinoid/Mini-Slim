@@ -474,6 +474,7 @@ sub update_track_pos {
         my $tracklen = int($$client{tracklen});
         $seconds_part = $tracklen % 60;
         $minutes_part = ($tracklen - $seconds_part) / 60;
+        $seconds_part = "0$seconds_part" while length($seconds_part) < 2;
         $self->render_text_at($client, 190, 0, 239, 12, "$minutes_part:$seconds_part");
         my $full = $seconds / $$client{tracklen};
         $full *= (180-45);
