@@ -9,6 +9,7 @@ use File::Basename;
 use GD;
 use IO::Select;
 use IO::Socket::INET;
+use IO::Dir;
 use Time::HiRes qw(tv_interval gettimeofday);
 use blib;
 use Mini::Slim::Util;
@@ -19,6 +20,15 @@ our $have_audio_flac_header = 0;
 eval { require Audio::FLAC::Header; $have_audio_flac_header = 1 };
 our $have_mp3_info = 0;
 eval { require MP3::Info; $have_mp3_info = 1 };
+
+my %type_by_extension = (
+    'flac' => 'f',
+    'ogg'  => 'o',
+    'mp3'  => 'm',
+    'aac'  => 'a',
+    'alac' => 'l',
+    'wma'  => 'w',
+);
 
 =head1 NAME
 
@@ -54,6 +64,7 @@ sub new {
     my $package = shift;
     my @args = @_;
     my $musicdir = config('musicdir');
+    $musicdir .= '/' unless substr($musicdir,length($musicdir)-1) eq '/';
     foreach my $i (0..@args-1) {
         if(substr($args[$i], 0, length($musicdir)) eq $musicdir) {
             substr($args[$i], 0, length($musicdir), '');
@@ -163,7 +174,7 @@ sub play {
         unless $pl_entries;
     $$client{pl_pos} = $pl_entries - 1
         if($$client{pl_pos} >= $pl_entries);
-    if($$client{state} eq 'paused') {
+    if($$client{'state'} eq 'paused') {
         $self->send_strm($client, command    => 'u');
     } else {
         $self->stream_new_track($client, $$client{playlist}[$$client{pl_pos}]);
@@ -190,22 +201,11 @@ sub pause {
 sub stream_new_track {
     my ($self, $client, $path) = @_;
     delete($$client{tracklen});
-    my $realpath = config('musicdir', '') . $path;
-    if(!-f $realpath) {
-        $self->info("stream_new_track: could not find $path!\n");
-        return -1;
-    }
+    my $realpath = config('musicdir', '') . '/' . $path;
+    die("stream_new_track: could not find $path!") unless -f $realpath;
     my $type;
     if($path =~ /\.([^\/]+)$/) {
         my $ext = lc($1);
-        my %type_by_extension = (
-            'flac' => 'f',
-            'ogg'  => 'o',
-            'mp3'  => 'm',
-            'aac'  => 'a',
-            'alac' => 'l',
-            'wma'  => 'w',
-        );
         if(!exists($type_by_extension{$ext})) {
             $self->info("stream_new_track: could not recognize extension '$ext'\n");
             return -1;
@@ -215,7 +215,7 @@ sub stream_new_track {
         $self->info("stream_new_track: could not find file extension in $path\n");
         return -1;
     }
-    my $http_path = config('httpdir', '') . $path;
+    my $http_path = config('httpdir', '') . '/' . $path;
     # close any previous connection it may have had.
     $self->send_strm($client, command    => 'f');
     # start the new stream
@@ -239,13 +239,13 @@ Handle keys sent to us via an infrared remote control.
 
 # unhandled keys:
 #        power
-#        add up play
-#        left unknown right
-#        unknown down browse
+#        add play
+#        unknown
+#        unknown
 #        1 2 3 4 5 6 7 8 9
 #        favorites 0 search
 #        shuffle repeat sleep
-#        nowplaying size brightness
+#        size
 our %keypress_handlers = (
     'volup'      => { handler => \&key_volume_handler, fluid => 1 },
     'voldown'    => { handler => \&key_volume_handler, fluid => 1 },
@@ -253,6 +253,14 @@ our %keypress_handlers = (
     'fastfwd'    => { handler => \&key_seek_handler,   fluid => 1 },
     'pause'      => { handler => \&key_pause_handler },
     'brightness' => { handler => \&key_brightness_handler },
+    'browse'     => { handler => \&key_browse_handler },
+    'nowplaying' => { handler => \&key_nowplaying_handler },
+    'left'       => { handler => \&key_left_right_handler, fluid => 1 },
+    'right'      => { handler => \&key_left_right_handler, fluid => 1 },
+    'up'         => { handler => \&key_up_down_handler, fluid => 1 },
+    'down'       => { handler => \&key_up_down_handler, fluid => 1 },
+    'add'        => { handler => \&key_add_handler },
+    'play'       => { handler => \&key_play_handler },
 );
 sub handle_keypress {
     my ($self, $client, $key, $ts) = @_;
@@ -395,6 +403,122 @@ sub key_brightness_handler {
     $self->send_grfb($client, level => $$client{brightness});
 }
 
+sub key_nowplaying_handler {
+    my ($self, $client, $ts, $key) = @_;
+    $$client{display} = $$client{displays}{playback};
+    $self->update_display($client);
+}
+
+sub key_browse_handler {
+    my ($self, $client, $ts, $key) = @_;
+    $$client{display} = $$client{displays}{browser};
+    $self->update_browser_display($client);
+    $self->update_display($client);
+}
+
+sub key_up_down_handler {
+    my ($self, $client, $ts, $key) = @_;
+    return unless $$client{display} == $$client{displays}{browser};
+    my $ctxt = $$client{browser};
+    my $dir = $$ctxt{dir};
+    my $min = 0;
+    my $max = scalar @$dir;
+    my $offset = $$ctxt{offset};
+    if($key eq 'up') {
+        $offset--;
+    } elsif($key eq 'down') {
+        $offset++;
+    } else {
+        die("Unhandled key '$key'");
+    }
+    $offset = $min   if $offset <  $min;
+    $offset = $max-1 if $offset >= $max;
+    $$ctxt{offset} = $offset;
+    $self->update_browser_display($client);
+    $self->update_display($client);
+}
+
+sub key_left_right_handler {
+    my ($self, $client, $ts, $key) = @_;
+    return unless $$client{display} == $$client{displays}{browser} || $key eq 'init';
+    my $ctxt = $$client{browser};
+    my $path = $$ctxt{path};
+    if($key eq 'init') {
+        $path = [];
+        $ctxt = $$client{browser} = { path => $path };
+    } elsif($key eq 'left') {
+        pop(@$path);
+    } elsif($key eq 'right') {
+        my $i = $$ctxt{offset};
+        my $dir = $$ctxt{dir};
+        my $min = 0;
+        my $max = scalar @$dir - 1;
+        return if $max < $min;
+        $i = $min if $i < $min;
+        $i = $max if $i > $max;
+        my $entry = $$dir[$i];
+        return unless $$entry{type} eq 'dir';
+        push(@$path, $$entry{name});
+    } else {
+        die("unknown key '$key'");
+    }
+    $path = config('musicdir') . '/' . join('/', @$path);
+    die("bad path $path") unless -d $path;
+    my $dir = IO::Dir->new($path);
+    my %dir;
+    while(defined($_ = $dir->read)) {
+        next if $_ eq '.';
+        next if $_ eq '..';
+        my $ext = '';
+        if(lc =~ /\.([^.]+)$/) {
+            $ext = $1;
+        }
+        my $type;
+        $type = 'track' if exists $type_by_extension{$ext};
+        $type = 'dir' if -d "$path/$_";
+        next unless defined $type;
+        $dir{$_} = $type;
+    }
+    my @dir;
+    foreach my $name (sort keys %dir) {
+        push(@dir, { name => $name, type => $dir{$name} });
+    }
+    $$ctxt{dir} = \@dir;
+    $$ctxt{offset} = 0;
+    if($key ne 'init') {
+        $self->update_browser_display($client);
+        $self->update_display($client);
+    }
+}
+
+sub key_add_handler {
+    my ($self, $client, $ts, $key) = @_;
+    my $ctxt = $$client{browser};
+    return unless $$client{display} == $$client{displays}{browser};
+    return unless $$ctxt{dir}[$$ctxt{offset}]{type} eq 'track';
+    my $fn = join('/', @{$$ctxt{path}}, $$ctxt{dir}[$$ctxt{offset}]{name});
+    die("invalid file") unless -f config('musicdir').'/'.$fn;
+    push(@{$$client{playlist}},$fn);
+    $self->update_browser_display($client);
+    $self->update_playlist_pos($client);
+    $self->update_display($client);
+}
+
+sub key_play_handler {
+    my ($self, $client, $ts, $key) = @_;
+    my $ctxt = $$client{browser};
+    return unless $$client{display} == $$client{displays}{browser};
+    return unless $$ctxt{dir}[$$ctxt{offset}]{type} eq 'track';
+    my $fn = join('/', @{$$ctxt{path}}, $$ctxt{dir}[$$ctxt{offset}]{name});
+    die("invalid file") unless -f config('musicdir').'/'.$fn;
+    $$client{playlist} = [$fn];
+    $self->play($client);
+    $$client{display} = $$client{displays}{playback};
+    $self->update_display($client);
+#    $self->update_browser_display($client);
+#    $self->update_playlist_pos($client);
+#    $self->update_display($client);
+}
 
 =head1 UI Output
 
@@ -414,7 +538,7 @@ sub setup_display {
     $$client{ysize} = $ysize;
     $self->info("setup_display: $xsize x $ysize\n");
     $$client{displays} = {};
-    for my $displayname ('playback', 'volume', 'trackchange') {
+    for my $displayname ('playback', 'volume', 'trackchange', 'browser') {
         my $display = $$client{displays}{$displayname} = {};
         $$display{gd} = GD::Image->new($xsize, $ysize);
         $$display{gd_white} = $$display{gd}->colorAllocate(255,255,255);
@@ -498,6 +622,41 @@ sub render_text_at {
     $font = GD::Font->Small() unless defined $font;
     $$display{gd}->filledRectangle($x, $y, $xend, $yend, $$display{gd_black});
     $$display{gd}->string($font, $x+1, $y, $text, $$display{gd_white});
+}
+
+
+=head2 render_file_symbol
+
+Draw a little icon representing a directory or a music file.
+
+=cut
+
+sub render_icon_at {
+    my ($self, $display, $x, $y, $xend, $yend, $type) = @_;
+    my $half      = ($yend - $y) / 2;
+    my $quarter   = $half / 2;
+    my $eighth    = $half / 4;
+    my $third     = ($yend - $y) / 3;
+    my $twothirds = ($yend - $y) * 2 / 3;
+    $$display{gd}->filledRectangle($x, $y, $xend, $yend, $$display{gd_black});
+    if($type eq 'dir') {
+        # draw a little manila folder
+        $$display{gd}->rectangle($x, $y+$half, $xend, $yend, $$display{gd_white});
+        $$display{gd}->fill($x+1, $y+$half+1, $$display{gd_white});
+        $$display{gd}->line($x+$quarter, $y+$quarter+$eighth, $x         , $y+$half    , $$display{gd_white});
+        $$display{gd}->line($x+$quarter, $y+$quarter+$eighth, $x+$half   , $y+$half    , $$display{gd_white});
+        $$display{gd}->fill($x+$quarter, $y+$quarter+$eighth+1, $$display{gd_white});
+    }
+    if($type eq 'track') {
+        $$display{gd}->line($x           , $y+$twothirds, $x+$third    , $yend        , $$display{gd_white});
+        $$display{gd}->line($x+$third    , $yend        , $xend        , $y+$third    , $$display{gd_white});
+        $$display{gd}->line($xend        , $y+$third    , $x+$twothirds, $y           , $$display{gd_white});
+        $$display{gd}->line($x+$twothirds, $y           , $x           , $y+$twothirds, $$display{gd_white});
+    }
+    if($type eq 'playlist') {
+        $$display{gd}->line($x+$half , $y+$third, $x+$half, $y+$twothirds, $$display{gd_white});
+        $$display{gd}->line($x+$third , $y+$half, $x+$twothirds, $y+$half, $$display{gd_white});
+    }
 }
 
 
@@ -624,6 +783,58 @@ sub update_trackchange_display {
     my $fn = basename($$client{playlist}[$$client{pl_pos}]);
     $self->render_text_at($display, 20, 3 , $$client{xsize}, 14, "Skipping to track $pos (of $total)");
     $self->render_text_at($display, 20, 15, $$client{xsize}, $$client{ysize}, $fn);
+}
+
+
+=head2 update_browser_display
+
+Re-draw the file browser display.
+
+=cut
+
+sub update_browser_display {
+    my ($self, $client) = @_;
+    my $display = $$client{displays}{browser};
+    my $ctxt = $$client{browser};
+    my $prefix = join('/', @{$$ctxt{path}});
+    $prefix .= '/' if length $prefix;
+    my $dir = $$ctxt{dir};
+    my $min = 0;
+    my $cur = $$ctxt{offset};
+    my $max = scalar @$dir - 1;
+    my $line1_width =  9;
+    my $line2_width = 14;
+    my $line3_width =  9;
+    my $line1_begin =  0;
+    my $line2_begin = $line1_begin + $line1_width;
+    my $line3_begin = $line2_begin + $line2_width;
+    my $line1_end = $line2_begin - 1;
+    my $line2_end = $line3_begin - 1;
+    my $line3_end = $line3_begin + $line3_width - 1;
+    my %playlist = map { $_ => 1 } @{$$client{playlist}};
+
+    $self->render_text_at($display, 0,  10, 20, 20, '=>');
+
+    $self->render_text_at($display, 20                            , $line2_begin, $$client{xsize}             , $line2_end, $$dir[$cur]{name});
+    $self->render_icon_at($display, $$client{xsize}-$line2_width  , $line2_begin, $$client{xsize}             , $line2_end, $$dir[$cur]{type});
+    $self->render_icon_at($display, $$client{xsize}-$line2_width*2, $line2_begin, $$client{xsize}-$line2_width, $line2_end, "playlist")
+        if exists($playlist{$prefix . $$dir[$cur]{name}});
+    if($cur > $min) {
+        $self->render_text_at($display, 20                            , $line1_begin, $$client{xsize}             , $line1_end, $$dir[$cur-1]{name}, GD::Font->Tiny());
+        $self->render_icon_at($display, $$client{xsize}-$line1_width  , $line1_begin, $$client{xsize}             , $line1_end, $$dir[$cur-1]{type});
+        $self->render_icon_at($display, $$client{xsize}-$line1_width*2, $line1_begin, $$client{xsize}-$line1_width, $line1_end, "playlist")
+            if exists($playlist{$prefix . $$dir[$cur-1]{name}});
+    } else {
+        $$display{gd}->filledRectangle(0, $line1_begin, $$client{xsize}, $line1_end, $$display{gd_black});
+    }
+    if($cur < $max) {
+        $self->render_text_at($display, 20                            , $line3_begin, $$client{xsize}             , $line3_end, $$dir[$cur+1]{name}, GD::Font->Tiny());
+        $self->render_icon_at($display, $$client{xsize}-$line3_width  , $line3_begin, $$client{xsize}             , $line3_end, $$dir[$cur+1]{type});
+        $self->render_icon_at($display, $$client{xsize}-$line3_width*2, $line3_begin, $$client{xsize}-$line1_width, $line3_end, "playlist")
+            if exists($playlist{$prefix . $$dir[$cur+1]{name}});
+    } else {
+        $$display{gd}->filledRectangle(0, $line3_begin, $$client{xsize}, $line3_end, $$display{gd_black});
+    }
 }
 
 
@@ -758,13 +969,14 @@ sub handle_HELO {
     $$client{brightness} = $self->perclient_config($mac, 'brightness', 3);
     $$client{repeatrate} = 200;
 
-#    $self->send_version($client, "6.5.4");
     $self->send_aude($client);
     $self->send_audg($client);
     $self->schedule_work(\&setup_display, $self, $client)
         if($$client{displaytype} ne 'unknown');
     $self->stop($client);
     $self->schedule_work(\&play, $self, $client);
+
+    $self->schedule_work(\&key_left_right_handler, $self, $client, 0, 'init');
     return 0;
 }
 
