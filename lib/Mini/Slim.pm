@@ -389,7 +389,7 @@ sub track_change_timer {
 
 sub key_brightness_handler {
     my ($self, $client, $ts, $key) = @_;
-    return if $$client{display} eq 'unknown';
+    return if $$client{displaytype} eq 'unknown';
     $$client{brightness}++;
     $$client{brightness} = 0 if $$client{brightness} > 4;
     $self->send_grfb($client, level => $$client{brightness});
@@ -409,7 +409,7 @@ sub setup_display {
     $self->send_grfb($client, level => $$client{brightness});
     $self->send_visu($client, which => 0);
     $self->send_visu($client, which => 2);
-    my ($xsize, $ysize) = ($$client{display} =~ /(\d+)x(\d+)/);
+    my ($xsize, $ysize) = ($$client{displaytype} =~ /(\d+)x(\d+)/);
     $$client{xsize} = $xsize;
     $$client{ysize} = $ysize;
     $self->info("setup_display: $xsize x $ysize\n");
@@ -736,10 +736,10 @@ sub handle_HELO {
         $$client{type} = "unknown ($type)";
     }
     if(exists($display_types{$$client{type}})) {
-        $$client{display} = $display_types{$$client{type}};
+        $$client{displaytype} = $display_types{$$client{type}};
     } else {
         $self->info("I don't know what kind of display client type $$client{type} has.\n");
-        $$client{display} = 'unknown';
+        $$client{displaytype} = 'unknown';
     }
     $$client{revision} = vec($data, 1, 8);
     $self->info("$$client{addr} is $$client{type} version $$client{revision}.\n");
@@ -762,7 +762,7 @@ sub handle_HELO {
     $self->send_aude($client);
     $self->send_audg($client);
     $self->schedule_work(\&setup_display, $self, $client)
-        if($$client{display} ne 'unknown');
+        if($$client{displaytype} ne 'unknown');
     $self->stop($client);
     $self->schedule_work(\&play, $self, $client);
     return 0;
@@ -846,7 +846,7 @@ sub handle_STAT {
             } else {
                 $$client{state} = $state;
                 if($state eq 'playing') {
-                    if($$client{display} ne 'unknown') {
+                    if($$client{displaytype} ne 'unknown') {
                         $self->schedule_work(\&update_track_name, $self, $client);
                         $self->schedule_work(\&update_playlist_pos, $self, $client);
                         $self->schedule_work(\&update_display, $self, $client);
@@ -856,7 +856,7 @@ sub handle_STAT {
         }
         if($event eq 'STMt') {
             $$client{trackpos} = $tracksec;
-            if($$client{display} ne 'unknown') {
+            if($$client{displaytype} ne 'unknown') {
                 $self->schedule_work(\&update_track_pos, $self, $client);
                 $self->schedule_work(\&update_display, $self, $client);
             }
