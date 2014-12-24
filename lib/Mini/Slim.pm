@@ -517,22 +517,24 @@ sub render_bar_at {
     my $full = int($value * ($xend-$x));
     # clear old data
     $$display{gd}->filledRectangle($x, $y, $xend, $yend, $$display{gd_black});
-    # left end
-    $$display{gd}->arc($x   +$radius, $y+$radius, $diameter, $diameter, 90 , 270, $$display{gd_white});
-    # right end
-    $$display{gd}->arc($xend-$radius, $y+$radius, $diameter, $diameter, 270, 90 , $$display{gd_white});
-    # connecting line above
-    $$display{gd}->line($x+$radius, $y   , $xend-$radius, $y   , $$display{gd_white});
-    # connecting line below
-    $$display{gd}->line($x+$radius, $yend, $xend-$radius, $yend, $$display{gd_white});
-    # ensure some edge cases (so that we can fill safely)
-    $$display{gd}->line($x   , $y+$radius, $xend  , $y+$radius, $$display{gd_white});
-    $$display{gd}->line($x+1 , $y+$radius, $xend-1, $y+$radius, $$display{gd_black});
+    # white rectangle
+    $$display{gd}->rectangle($x, $y, $xend, $yend, $$display{gd_white});
     # vertical line to bound the filled region
     $$display{gd}->line($x+$full, $y, $x+$full, $yend, $$display{gd_white});
+    # fill the left part with white
     if($full > 0) {
         $$display{gd}->fill($x+$full-1, $y+$radius, $$display{gd_white});
     }
+    # round off the left end
+    $$display{gd}->arc($x   +$radius, $y+$radius, $diameter  , $diameter  , 90 , 270, $$display{gd_white});
+    $$display{gd}->arc($x   +$radius, $y+$radius, $diameter+1, $diameter+1, 90 , 270, $$display{gd_black});
+    $$display{gd}->fill($x, $y   , $$display{gd_black});
+    $$display{gd}->fill($x, $yend, $$display{gd_black});
+    # round off the right end
+    $$display{gd}->arc($xend-$radius, $y+$radius, $diameter  , $diameter  , 270, 90 , $$display{gd_white});
+    $$display{gd}->arc($xend-$radius, $y+$radius, $diameter+1, $diameter+1, 270, 90 , $$display{gd_black});
+    $$display{gd}->fill($xend, $y   , $$display{gd_black});
+    $$display{gd}->fill($xend, $yend, $$display{gd_black});
 }
 
 =head2 update_track_pos
@@ -556,7 +558,7 @@ sub update_track_pos {
         $seconds_part = "0$seconds_part" while length($seconds_part) < 2;
         $self->render_text_at($playback, 190, 0, 239, 12, "$minutes_part:$seconds_part");
         my $full = $seconds / $$client{tracklen};
-        $self->render_bar_at($playback, 44, 3, 180, 9, $full);
+        $self->render_bar_at($playback, 44, 3, 180, 11, $full);
     }
 }
 
