@@ -778,9 +778,13 @@ Re-draw the trackchange display.
 sub update_trackchange_display {
     my ($self, $client) = @_;
     my $display = $$client{displays}{trackchange};
-    my $pos = $$client{pl_pos} + 1;
-    my $total = scalar @{$$client{playlist}};
-    my $fn = basename($$client{playlist}[$$client{pl_pos}]);
+    my $pl  = $$client{playlist};
+    my $pos = $$client{pl_pos};
+    my $total = scalar @$pl;
+    return unless $pos >= 0;
+    return unless $pos < $total;
+    my $fn = basename($$pl[$pos]);
+    $pos++;
     $self->render_text_at($display, 20, 3 , $$client{xsize}, 14, "Skipping to track $pos (of $total)");
     $self->render_text_at($display, 20, 15, $$client{xsize}, $$client{ysize}, $fn);
 }
